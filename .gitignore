@@ -1,0 +1,8 @@
+/x64/
+/x86/
+*.obj
+*.dll
+*.lib
+*.exp
+*.res
+*.pdb
