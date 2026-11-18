@@ -279,7 +279,9 @@ public:
     int GetItemWidth() const override { return 145; }
     int GetItemWidthEx(void* dc) const override {
         SIZE size{};
-        const std::wstring text = DisplayText();
+        const std::wstring value = GetItemValueText();
+        const std::wstring text = std::wstring(label_) +
+            (value.find(L"--") == std::wstring::npos ? value : sample_);
         if (!dc || !GetTextExtentPoint32W(static_cast<HDC>(dc), text.c_str(),
                                          static_cast<int>(text.size()), &size))
             return 0;
@@ -338,6 +340,10 @@ public:
         case 1: return &cost_;
         default: return nullptr;
         }
+    }
+
+    void OnInitialize(ITrafficMonitor*) override {
+        DataRequired();
     }
 
     void DataRequired() override {
@@ -750,7 +756,7 @@ public:
         case TMI_NAME: return L"CC Switch Usage";
         case TMI_DESCRIPTION: return L"显示 CC Switch Token 和费用，支持切换统计周期与显示币种。";
         case TMI_AUTHOR: return L"CC Switch Usage contributors";
-        case TMI_VERSION: return L"0.1.13";
+        case TMI_VERSION: return L"0.1.14";
         default: return L"";
         }
     }
