@@ -4,6 +4,8 @@
 #include <winsqlite/winsqlite3.h>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <vector>
 #include <string>
 #include <memory>
@@ -368,16 +370,14 @@ public:
 
         const std::lock_guard<std::mutex> lock(refreshMutex_);
         if (options.selectedProviders[0] == tokenProviders_ && options.selectedProviders[1] == costProviders_ &&
-            options.period == selected_ && options.cny == showCny_ && options.rate == billingRate_)
+            options.period == selected_ && options.cny == showCny_ && options.rate == billingRate_ && preferencesSaved_)
             return OR_OPTION_UNCHANGED;
-        if (options.rate != billingRate_) {
-            wchar_t value[64]{};
-            if (options.rate > 0) swprintf_s(value, L"%.15g", options.rate);
-            if (!WritePrivateProfileStringW(L"Billing", L"CnyPerUsd", value, SettingsPath().c_str())) {
-                MessageBoxW(static_cast<HWND>(parent), L"无法保存费用设置。", L"CC Switch Usage", MB_ICONERROR);
-                return OR_OPTION_UNCHANGED;
-            }
+        if (!SavePreferences(options.period, options.cny, options.rate,
+                             options.selectedProviders[0], options.selectedProviders[1])) {
+            MessageBoxW(static_cast<HWND>(parent), L"无法保存插件设置。", L"CC Switch Usage", MB_ICONERROR);
+            return OR_OPTION_UNCHANGED;
         }
+        preferencesSaved_ = true;
         tokenProviders_ = std::move(options.selectedProviders[0]);
         costProviders_ = std::move(options.selectedProviders[1]);
         billingRate_ = options.rate;
@@ -407,12 +407,9 @@ public:
         if (index < 0 || index > cnyCommand)
             return;
         const std::lock_guard<std::mutex> lock(refreshMutex_);
-        if (index < periodCount)
-            selected_ = index;
-        else {
-            showCny_ = index == cnyCommand;
-            currencyInitialized_ = true;
-        }
+        const int period = index < periodCount ? index : selected_;
+        const bool cny = index < periodCount ? showCny_ : index == cnyCommand;
+        ApplyShortcut(period, cny);
         Refresh(true);
     }
 
@@ -432,6 +429,90 @@ private:
         const double rate = wcstod(value, &end);
         return end != value && !*end && std::isfinite(rate) && rate > 0 && rate <= 1000 ? rate : 0;
     }
+
+    static bool SavePreferences(int period, bool cny, double rate,
+                                const std::vector<Provider>& tokens, const std::vector<Provider>& costs) {
+        try {
+            const auto legacy = SettingsPath();
+            if (legacy.empty()) return false;
+            auto path = std::filesystem::path(legacy).replace_extension(L".prefs");
+            std::filesystem::create_directories(path.parent_path());
+            auto pending = path;
+            pending += L".tmp";
+            std::wostringstream output;
+            output.imbue(std::locale::classic());
+            output << L"1 " << period << L' ' << cny << L' ' << std::setprecision(17) << rate;
+            for (const auto* providers : {&tokens, &costs}) {
+                output << L' ' << providers->size();
+                for (const auto& provider : *providers)
+                    output << L' ' << std::quoted(provider.app) << L' ' << std::quoted(provider.id)
+                           << L' ' << std::quoted(provider.label);
+            }
+            const auto value = output.str();
+            std::ofstream file(pending, std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char*>(value.data()), value.size() * sizeof(wchar_t));
+            file.close();
+            if (file && MoveFileExW(pending.c_str(), path.c_str(),
+                                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                return true;
+            DeleteFileW(pending.c_str());
+        } catch (...) {
+            return false;
+        }
+        return false;
+    }
+
+    void RestorePreferences() {
+        try {
+            const auto legacy = SettingsPath();
+            if (legacy.empty()) return;
+            const auto path = std::filesystem::path(legacy).replace_extension(L".prefs");
+            std::ifstream file(path, std::ios::binary | std::ios::ate);
+            const auto size = file.tellg();
+            if (size <= 0 || size > 1024 * 1024 || size % sizeof(wchar_t) != 0) return;
+            std::wstring value(static_cast<size_t>(size) / sizeof(wchar_t), L'\0');
+            file.seekg(0);
+            if (!file.read(reinterpret_cast<char*>(value.data()), size)) return;
+            std::wistringstream input(value);
+            input.imbue(std::locale::classic());
+            int version{}, period{}, cny{};
+            double rate{};
+            if (!(input >> version >> period >> cny >> rate) || version != 1 ||
+                period < 0 || period >= periodCount || (cny != 0 && cny != 1) ||
+                !std::isfinite(rate) || rate < 0 || rate > 1000)
+                return;
+            std::vector<Provider> tokens, costs;
+            for (auto* providers : {&tokens, &costs}) {
+                size_t count{};
+                if (!(input >> count) || count > 4096) return;
+                for (size_t index = 0; index < count; ++index) {
+                    Provider provider;
+                    if (!(input >> std::quoted(provider.app) >> std::quoted(provider.id) >>
+                          std::quoted(provider.label)) || provider.app.empty() || provider.id.empty())
+                        return;
+                    providers->push_back(std::move(provider));
+                }
+            }
+            selected_ = period;
+            showCny_ = cny != 0;
+            billingRate_ = rate;
+            tokenProviders_ = std::move(tokens);
+            costProviders_ = std::move(costs);
+            currencyInitialized_ = true;
+            preferencesSaved_ = true;
+        } catch (...) {
+            // Use defaults and the legacy billing rate if preferences cannot be read.
+        }
+    }
+
+    void ApplyShortcut(int period, bool cny) {
+        preferencesSaved_ = SavePreferences(period, cny, billingRate_, tokenProviders_, costProviders_);
+        selected_ = period;
+        showCny_ = cny;
+        currencyInitialized_ = true;
+    }
+
+    UsagePlugin() { RestorePreferences(); }
 
     struct Options {
         int period{};
@@ -543,12 +624,9 @@ private:
     static void ActivateItem(bool toggleCurrency) {
         auto& plugin = Instance();
         const std::lock_guard<std::mutex> lock(plugin.refreshMutex_);
-        if (toggleCurrency) {
-            plugin.showCny_ = !plugin.showCny_;
-            plugin.currencyInitialized_ = true;
-        }
-        else
-            plugin.selected_ = (plugin.selected_ + 1) % periodCount;
+        const int period = toggleCurrency ? plugin.selected_ : (plugin.selected_ + 1) % periodCount;
+        const bool cny = toggleCurrency ? !plugin.showCny_ : plugin.showCny_;
+        plugin.ApplyShortcut(period, cny);
         plugin.Refresh(true);
     }
 
@@ -644,7 +722,7 @@ public:
         case TMI_NAME: return L"CC Switch Usage";
         case TMI_DESCRIPTION: return L"显示 CC Switch Token 和费用，支持切换统计周期与显示币种。";
         case TMI_AUTHOR: return L"CC Switch Usage contributors";
-        case TMI_VERSION: return L"0.1.11";
+        case TMI_VERSION: return L"0.1.12";
         default: return L"";
         }
     }
@@ -660,6 +738,7 @@ private:
     bool showCny_{};
     double billingRate_ = LoadBillingRate();
     bool currencyInitialized_{};
+    bool preferencesSaved_{};
     ULONGLONG nextRefresh_{};
     wchar_t tooltip_[768] = L"正在读取 CC Switch 用量。";
 };
