@@ -27,6 +27,18 @@ constexpr Period periods[] = {{L"今日", 1}, {L"近24小时", 0}, {L"近7天", 
 constexpr int periodCount = sizeof(periods) / sizeof(periods[0]);
 constexpr int usdCommand = periodCount;
 constexpr int cnyCommand = periodCount + 1;
+struct RefreshInterval {
+    int seconds;
+    const wchar_t* label;
+};
+
+constexpr RefreshInterval refreshIntervals[] = {
+    {5, L"5 秒"}, {15, L"15 秒"}, {30, L"30 秒"}, {60, L"1 分钟"},
+    {120, L"2 分钟"}, {300, L"5 分钟"}, {600, L"10 分钟"}, {1800, L"30 分钟"}
+};
+constexpr int defaultRefreshInterval = 2;
+constexpr int refreshIntervalCount = _countof(refreshIntervals);
+
 struct CurrencySettings {
     bool preferCny{};
     double cnyPerUsd{};
@@ -338,7 +350,7 @@ public:
         {
             const std::lock_guard<std::mutex> lock(refreshMutex_);
             Refresh(false);
-            options = {selected_, showCny_, billingRate_};
+            options = {selected_, showCny_, billingRate_, refreshInterval_};
             options.selectedProviders[0] = tokenProviders_;
             options.selectedProviders[1] = costProviders_;
             try {
@@ -370,9 +382,9 @@ public:
 
         const std::lock_guard<std::mutex> lock(refreshMutex_);
         if (options.selectedProviders[0] == tokenProviders_ && options.selectedProviders[1] == costProviders_ &&
-            options.period == selected_ && options.cny == showCny_ && options.rate == billingRate_ && preferencesSaved_)
+            options.period == selected_ && options.cny == showCny_ && options.rate == billingRate_ && options.refreshInterval == refreshInterval_ && preferencesSaved_)
             return OR_OPTION_UNCHANGED;
-        if (!SavePreferences(options.period, options.cny, options.rate,
+        if (!SavePreferences(options.period, options.cny, options.rate, options.refreshInterval,
                              options.selectedProviders[0], options.selectedProviders[1])) {
             MessageBoxW(static_cast<HWND>(parent), L"无法保存插件设置。", L"CC Switch Usage", MB_ICONERROR);
             return OR_OPTION_UNCHANGED;
@@ -381,6 +393,7 @@ public:
         tokenProviders_ = std::move(options.selectedProviders[0]);
         costProviders_ = std::move(options.selectedProviders[1]);
         billingRate_ = options.rate;
+        refreshInterval_ = options.refreshInterval;
         selected_ = options.period;
         showCny_ = options.cny;
         currencyInitialized_ = true;
@@ -430,7 +443,7 @@ private:
         return end != value && !*end && std::isfinite(rate) && rate > 0 && rate <= 1000 ? rate : 0;
     }
 
-    static bool SavePreferences(int period, bool cny, double rate,
+    static bool SavePreferences(int period, bool cny, double rate, int refreshInterval,
                                 const std::vector<Provider>& tokens, const std::vector<Provider>& costs) {
         try {
             const auto legacy = SettingsPath();
@@ -448,6 +461,7 @@ private:
                     output << L' ' << std::quoted(provider.app) << L' ' << std::quoted(provider.id)
                            << L' ' << std::quoted(provider.label);
             }
+            output << L' ' << refreshIntervals[refreshInterval].seconds;
             const auto value = output.str();
             std::ofstream file(pending, std::ios::binary | std::ios::trunc);
             file.write(reinterpret_cast<const char*>(value.data()), value.size() * sizeof(wchar_t));
@@ -493,6 +507,13 @@ private:
                     providers->push_back(std::move(provider));
                 }
             }
+            int seconds{};
+            if (input >> seconds) {
+                for (int index = 0; index < refreshIntervalCount; ++index) {
+                    if (refreshIntervals[index].seconds == seconds)
+                        refreshInterval_ = index;
+                }
+            }
             selected_ = period;
             showCny_ = cny != 0;
             billingRate_ = rate;
@@ -506,7 +527,7 @@ private:
     }
 
     void ApplyShortcut(int period, bool cny) {
-        preferencesSaved_ = SavePreferences(period, cny, billingRate_, tokenProviders_, costProviders_);
+        preferencesSaved_ = SavePreferences(period, cny, billingRate_, refreshInterval_, tokenProviders_, costProviders_);
         selected_ = period;
         showCny_ = cny;
         currencyInitialized_ = true;
@@ -518,12 +539,14 @@ private:
         int period{};
         bool cny{};
         double rate{};
+        int refreshInterval = defaultRefreshInterval;
         std::vector<Provider> providers;
         std::vector<Provider> selectedProviders[2];
         bool providersAvailable{};
     };
 
     static INT_PTR CALLBACK OptionsProcedure(HWND dialog, UINT message, WPARAM command, LPARAM data) {
+        constexpr int refreshControl = 1010;
         constexpr int periodControl = 1001;
         constexpr int currencyControl = 1002;
         constexpr int providerControls[] = {1004, 1005};
@@ -538,6 +561,9 @@ private:
             for (const auto* currency : {L"美元 (USD)", L"人民币 (CNY)"})
                 SendDlgItemMessageW(dialog, currencyControl, CB_ADDSTRING, 0,
                                     reinterpret_cast<LPARAM>(currency));
+            for (const auto& interval : refreshIntervals)
+                SendDlgItemMessageW(dialog, refreshControl, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(interval.label));
+            SendDlgItemMessageW(dialog, refreshControl, CB_SETCURSEL, options->refreshInterval, 0);
             SendDlgItemMessageW(dialog, periodControl, CB_SETCURSEL, options->period, 0);
             SendDlgItemMessageW(dialog, currencyControl, CB_SETCURSEL, options->cny, 0);
             if (options->rate > 0) {
@@ -596,9 +622,11 @@ private:
                 return TRUE;
             }
             const auto period = SendDlgItemMessageW(dialog, periodControl, CB_GETCURSEL, 0, 0);
-            if (period < 0 || period >= periodCount)
+            const auto refresh = SendDlgItemMessageW(dialog, refreshControl, CB_GETCURSEL, 0, 0);
+            if (period < 0 || period >= periodCount || refresh < 0 || refresh >= refreshIntervalCount)
                 return TRUE;
             options->period = static_cast<int>(period);
+            options->refreshInterval = static_cast<int>(refresh);
             options->cny = SendDlgItemMessageW(dialog, currencyControl, CB_GETCURSEL, 0, 0) == 1;
             if (options->providersAvailable) {
                 for (int group = 0; group < 2; ++group) {
@@ -634,7 +662,7 @@ private:
         const auto now = GetTickCount64();
         if (!force && nextRefresh_ && now < nextRefresh_)
             return;
-        nextRefresh_ = now + 15000;
+        nextRefresh_ = now + refreshIntervals[refreshInterval_].seconds * 1000ULL;
 
         const auto& period = periods[selected_];
         Totals usage, costUsage;
@@ -661,7 +689,7 @@ private:
         if (!available && !costAvailable) {
             tokens_.SetValue(period, L"--");
             cost_.SetValue(period, L"--");
-            wcscpy_s(tooltip_, L"CC Switch 用量暂不可读，15 秒后重试。");
+            wcscpy_s(tooltip_, L"CC Switch 用量暂不可读，将在下次刷新时重试。");
             return;
         }
 
@@ -722,7 +750,7 @@ public:
         case TMI_NAME: return L"CC Switch Usage";
         case TMI_DESCRIPTION: return L"显示 CC Switch Token 和费用，支持切换统计周期与显示币种。";
         case TMI_AUTHOR: return L"CC Switch Usage contributors";
-        case TMI_VERSION: return L"0.1.12";
+        case TMI_VERSION: return L"0.1.13";
         default: return L"";
         }
     }
@@ -739,6 +767,7 @@ private:
     double billingRate_ = LoadBillingRate();
     bool currencyInitialized_{};
     bool preferencesSaved_{};
+    int refreshInterval_ = defaultRefreshInterval;
     ULONGLONG nextRefresh_{};
     wchar_t tooltip_[768] = L"正在读取 CC Switch 用量。";
 };
