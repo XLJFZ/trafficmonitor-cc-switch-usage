@@ -287,11 +287,11 @@ public:
     int GetItemWidthEx(void* dc) const override {
         SIZE size{};
         const auto value = GetItemValueText();
-        const std::wstring text = std::wstring(label_) + (wcsstr(value, L"--") ? sample_ : value);
-        if (!dc || !GetTextExtentPoint32W(static_cast<HDC>(dc), text.c_str(),
-                                         static_cast<int>(text.size()), &size))
+        const auto displayValue = wcsstr(value, L"--") ? sample_ : value;
+        if (!dc || !GetTextExtentPoint32W(static_cast<HDC>(dc), displayValue,
+                                         static_cast<int>(wcslen(displayValue)), &size))
             return 0;
-        return size.cx + 6;
+        return 64 + size.cx + 6;
     }
     void DrawItem(void* dc, int x, int y, int w, int h, bool dark) override {
         auto canvas = static_cast<HDC>(dc);
@@ -300,9 +300,14 @@ public:
         SetBkMode(canvas, TRANSPARENT);
         SetTextColor(canvas, slot_ == 0 ? (dark ? RGB(125, 211, 252) : RGB(3, 105, 161))
                                       : (dark ? RGB(252, 211, 77) : RGB(146, 64, 14)));
-        const std::wstring text = DisplayText();
-        RECT area{x + 2, y, x + w, y + h};
-        DrawTextW(canvas, text.c_str(), -1, &area, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        RECT labelArea{x + 2, y, x + 62, y + h};
+        RECT valueArea{x + 64, y, x + w, y + h};
+        DrawTextW(canvas, label_, -1, &labelArea,
+                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        const auto value = GetItemValueText();
+        const auto displayValue = wcsstr(value, L"--") ? sample_ : value;
+        DrawTextW(canvas, displayValue, -1, &valueArea,
+                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
         RestoreDC(canvas, saved);
     }
 
