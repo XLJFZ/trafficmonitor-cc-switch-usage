@@ -4,9 +4,8 @@
 #include <winsqlite/winsqlite3.h>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
-#include <sstream>
 #include <vector>
+#include <unordered_map>
 #include <string>
 #include <memory>
 #include <mutex>
@@ -23,22 +22,10 @@ struct Period {
 };
 
 // A zero day count selects a rolling window instead of local calendar dates.
-constexpr Period periods[] = {{L"今日", 1}, {L"近24小时", 0}, {L"近7天", 7}, {L"近30天", 30}};
+constexpr Period periods[] = {{L"今日", 1}, {L"近24小时", 0}, {L"近7天", 7}, {L"近30天", 30}, {L"总计", -1}};
 constexpr int periodCount = sizeof(periods) / sizeof(periods[0]);
 constexpr int usdCommand = periodCount;
 constexpr int cnyCommand = periodCount + 1;
-struct RefreshInterval {
-    int seconds;
-    const wchar_t* label;
-};
-
-constexpr RefreshInterval refreshIntervals[] = {
-    {5, L"5 秒"}, {15, L"15 秒"}, {30, L"30 秒"}, {60, L"1 分钟"},
-    {120, L"2 分钟"}, {300, L"5 分钟"}, {600, L"10 分钟"}, {1800, L"30 分钟"}
-};
-constexpr int defaultRefreshInterval = 2;
-constexpr int refreshIntervalCount = _countof(refreshIntervals);
-
 struct CurrencySettings {
     bool preferCny{};
     double cnyPerUsd{};
@@ -124,6 +111,8 @@ struct Provider {
     std::wstring id;
     std::wstring label;
 
+    std::wstring Key() const { return app + L"/" + id; }
+
     bool operator==(const Provider& other) const {
         return app == other.app && id == other.id;
     }
@@ -188,7 +177,12 @@ bool ReadUsage(const Period& period, Totals& result, const std::vector<Provider>
     GetLocalTime(&local);
     sqlite3_int64 start{}, end{};
     char startDate[11], endDate[11];
-    if (period.days == 0) {
+    if (period.days < 0) {
+        start = 0;
+        end = std::time(nullptr) + 1;
+        strcpy_s(startDate, "0000-01-01");
+        strcpy_s(endDate, "9999-12-31");
+    } else if (period.days == 0) {
         const auto now = std::time(nullptr);
         if (now == static_cast<std::time_t>(-1))
             return false;
@@ -279,9 +273,7 @@ public:
     int GetItemWidth() const override { return 145; }
     int GetItemWidthEx(void* dc) const override {
         SIZE size{};
-        const std::wstring value = GetItemValueText();
-        const std::wstring text = std::wstring(label_) +
-            (value.find(L"--") == std::wstring::npos ? value : sample_);
+        const std::wstring text = DisplayText();
         if (!dc || !GetTextExtentPoint32W(static_cast<HDC>(dc), text.c_str(),
                                          static_cast<int>(text.size()), &size))
             return 0;
@@ -314,7 +306,9 @@ public:
 
 private:
     std::wstring DisplayText() const {
-        return std::wstring(label_) + GetItemValueText();
+        const std::wstring value = GetItemValueText();
+        return std::wstring(label_) +
+            (value.find(L"--") != std::wstring::npos ? std::wstring(sample_) : value);
     }
 
     const wchar_t* name_;
@@ -329,6 +323,21 @@ private:
 
 class UsagePlugin final : public ITMPlugin {
 public:
+    UsagePlugin() {
+        const auto path = SettingsPath();
+        if (path.empty()) return;
+        selected_ = GetPrivateProfileIntW(L"Display", L"Period", 0, path.c_str());
+        if (selected_ < 0 || selected_ >= periodCount) selected_ = 0;
+        showCny_ = GetPrivateProfileIntW(L"Display", L"Cny", 0, path.c_str()) != 0;
+        defaultMultiplier_ = LoadBillingRate();
+        wchar_t value[64]{};
+        GetPrivateProfileStringW(L"Display", L"DefaultMultiplier", L"1", value, _countof(value), path.c_str());
+        wchar_t* end{};
+        const double multiplier = wcstod(value, &end);
+        if (end != value && !*end && std::isfinite(multiplier) && multiplier > 0 && multiplier <= 1000)
+            defaultMultiplier_ = multiplier;
+    }
+
     static UsagePlugin& Instance() {
         static UsagePlugin plugin;
         return plugin;
@@ -342,10 +351,6 @@ public:
         }
     }
 
-    void OnInitialize(ITrafficMonitor*) override {
-        DataRequired();
-    }
-
     void DataRequired() override {
         const std::lock_guard<std::mutex> refresh(refreshMutex_);
         Refresh(false);
@@ -356,7 +361,7 @@ public:
         {
             const std::lock_guard<std::mutex> lock(refreshMutex_);
             Refresh(false);
-            options = {selected_, showCny_, billingRate_, refreshInterval_};
+            options = {selected_, showCny_, billingRate_, defaultMultiplier_, 0};
             options.selectedProviders[0] = tokenProviders_;
             options.selectedProviders[1] = costProviders_;
             try {
@@ -365,41 +370,90 @@ public:
                 // Keep the existing filter if the database cannot be read.
             }
             options.providersAvailable = !options.providers.empty();
+            if (options.selectedProviders[0].empty() && options.selectedProviders[1].empty()) {
+                wchar_t saved[8192]{};
+                const auto path = SettingsPath();
+                for (int group = 0; group < 2; ++group) {
+                    GetPrivateProfileStringW(L"Providers", group == 0 ? L"Token" : L"Cost", L"", saved, _countof(saved), path.c_str());
+                    wchar_t* context{};
+                    for (wchar_t* item = wcstok_s(saved, L"|", &context); item; item = wcstok_s(nullptr, L"|", &context))
+                        for (const auto& provider : options.providers)
+                            if (provider.label == item) options.selectedProviders[group].push_back(provider);
+                }
+            }
             for (const auto& selection : options.selectedProviders) {
                 for (const auto& provider : selection) {
                     if (std::find(options.providers.begin(), options.providers.end(), provider) == options.providers.end())
                         options.providers.push_back(provider);
                 }
             }
+            wchar_t multiplier[64]{};
+            for (const auto& provider : options.providers) {
+                GetPrivateProfileStringW(L"Multipliers", provider.label.c_str(), L"", multiplier, _countof(multiplier), SettingsPath().c_str());
+                wchar_t* end{};
+                const double value = wcstod(multiplier, &end);
+                if (end != multiplier && !*end && std::isfinite(value) && value > 0 && value <= 1000)
+                    providerMultipliers_[provider.Key()] = value;
+            }
         }
-        INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
-        if (!InitCommonControlsEx(&controls))
-            return OR_OPTION_UNCHANGED;
         static const int moduleAnchor = 0;
         HMODULE module{};
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                 reinterpret_cast<LPCWSTR>(&moduleAnchor), &module))
             return OR_OPTION_UNCHANGED;
-
+        INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+        if (!InitCommonControlsEx(&controls))
+            return OR_OPTION_UNCHANGED;
         if (DialogBoxParamW(module, MAKEINTRESOURCEW(101), static_cast<HWND>(parent),
                             OptionsProcedure, reinterpret_cast<LPARAM>(&options)) != IDOK)
             return OR_OPTION_UNCHANGED;
-
         const std::lock_guard<std::mutex> lock(refreshMutex_);
         if (options.selectedProviders[0] == tokenProviders_ && options.selectedProviders[1] == costProviders_ &&
-            options.period == selected_ && options.cny == showCny_ && options.rate == billingRate_ && options.refreshInterval == refreshInterval_ && preferencesSaved_)
+            options.period == selected_ && options.cny == showCny_ && options.rate == billingRate_ &&
+            options.defaultMultiplier == defaultMultiplier_ && options.selectedMultiplier <= 0)
             return OR_OPTION_UNCHANGED;
-        if (!SavePreferences(options.period, options.cny, options.rate, options.refreshInterval,
-                             options.selectedProviders[0], options.selectedProviders[1])) {
-            MessageBoxW(static_cast<HWND>(parent), L"无法保存插件设置。", L"CC Switch Usage", MB_ICONERROR);
-            return OR_OPTION_UNCHANGED;
+        if (options.rate != billingRate_) {
+            wchar_t value[64]{};
+            if (options.rate > 0) swprintf_s(value, L"%.15g", options.rate);
+            if (!WritePrivateProfileStringW(L"Billing", L"CnyPerUsd", value, SettingsPath().c_str()))
+                return OR_OPTION_UNCHANGED;
         }
-        preferencesSaved_ = true;
         tokenProviders_ = std::move(options.selectedProviders[0]);
         costProviders_ = std::move(options.selectedProviders[1]);
         billingRate_ = options.rate;
-        refreshInterval_ = options.refreshInterval;
+        defaultMultiplier_ = options.defaultMultiplier;
+        const auto savePath = SettingsPath();
+        if (!savePath.empty()) {
+            wchar_t value[32];
+            swprintf_s(value, L"%d", selected_);
+            WritePrivateProfileStringW(L"Display", L"Period", value, savePath.c_str());
+            WritePrivateProfileStringW(L"Display", L"Cny", showCny_ ? L"1" : L"0", savePath.c_str());
+            swprintf_s(value, L"%.15g", defaultMultiplier_);
+            WritePrivateProfileStringW(L"Display", L"DefaultMultiplier", value, savePath.c_str());
+        }
+        if (options.selectedMultiplier > 0)
+            for (const auto& provider : costProviders_)
+                providerMultipliers_[provider.Key()] = options.selectedMultiplier;
+        const auto providerSavePath = SettingsPath();
+        if (!providerSavePath.empty()) {
+            for (int group = 0; group < 2; ++group) {
+                std::wstring value;
+                for (const auto& provider : options.selectedProviders[group]) {
+                    if (!value.empty()) value += L"|";
+                    value += provider.label;
+                }
+                WritePrivateProfileStringW(L"Providers", group == 0 ? L"Token" : L"Cost", value.c_str(), providerSavePath.c_str());
+            }
+            for (const auto& provider : costProviders_) {
+                const auto it = providerMultipliers_.find(provider.Key());
+                if (it != providerMultipliers_.end()) {
+                    wchar_t value[32];
+                    swprintf_s(value, L"%.15g", it->second);
+                    WritePrivateProfileStringW(L"Multipliers", provider.label.c_str(), value, providerSavePath.c_str());
+                }
+            }
+        }
         selected_ = options.period;
         showCny_ = options.cny;
         currencyInitialized_ = true;
@@ -426,9 +480,12 @@ public:
         if (index < 0 || index > cnyCommand)
             return;
         const std::lock_guard<std::mutex> lock(refreshMutex_);
-        const int period = index < periodCount ? index : selected_;
-        const bool cny = index < periodCount ? showCny_ : index == cnyCommand;
-        ApplyShortcut(period, cny);
+        if (index < periodCount)
+            selected_ = index;
+        else {
+            showCny_ = index == cnyCommand;
+            currencyInitialized_ = true;
+        }
         Refresh(true);
     }
 
@@ -449,110 +506,18 @@ private:
         return end != value && !*end && std::isfinite(rate) && rate > 0 && rate <= 1000 ? rate : 0;
     }
 
-    static bool SavePreferences(int period, bool cny, double rate, int refreshInterval,
-                                const std::vector<Provider>& tokens, const std::vector<Provider>& costs) {
-        try {
-            const auto legacy = SettingsPath();
-            if (legacy.empty()) return false;
-            auto path = std::filesystem::path(legacy).replace_extension(L".prefs");
-            std::filesystem::create_directories(path.parent_path());
-            auto pending = path;
-            pending += L".tmp";
-            std::wostringstream output;
-            output.imbue(std::locale::classic());
-            output << L"1 " << period << L' ' << cny << L' ' << std::setprecision(17) << rate;
-            for (const auto* providers : {&tokens, &costs}) {
-                output << L' ' << providers->size();
-                for (const auto& provider : *providers)
-                    output << L' ' << std::quoted(provider.app) << L' ' << std::quoted(provider.id)
-                           << L' ' << std::quoted(provider.label);
-            }
-            output << L' ' << refreshIntervals[refreshInterval].seconds;
-            const auto value = output.str();
-            std::ofstream file(pending, std::ios::binary | std::ios::trunc);
-            file.write(reinterpret_cast<const char*>(value.data()), value.size() * sizeof(wchar_t));
-            file.close();
-            if (file && MoveFileExW(pending.c_str(), path.c_str(),
-                                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-                return true;
-            DeleteFileW(pending.c_str());
-        } catch (...) {
-            return false;
-        }
-        return false;
-    }
-
-    void RestorePreferences() {
-        try {
-            const auto legacy = SettingsPath();
-            if (legacy.empty()) return;
-            const auto path = std::filesystem::path(legacy).replace_extension(L".prefs");
-            std::ifstream file(path, std::ios::binary | std::ios::ate);
-            const auto size = file.tellg();
-            if (size <= 0 || size > 1024 * 1024 || size % sizeof(wchar_t) != 0) return;
-            std::wstring value(static_cast<size_t>(size) / sizeof(wchar_t), L'\0');
-            file.seekg(0);
-            if (!file.read(reinterpret_cast<char*>(value.data()), size)) return;
-            std::wistringstream input(value);
-            input.imbue(std::locale::classic());
-            int version{}, period{}, cny{};
-            double rate{};
-            if (!(input >> version >> period >> cny >> rate) || version != 1 ||
-                period < 0 || period >= periodCount || (cny != 0 && cny != 1) ||
-                !std::isfinite(rate) || rate < 0 || rate > 1000)
-                return;
-            std::vector<Provider> tokens, costs;
-            for (auto* providers : {&tokens, &costs}) {
-                size_t count{};
-                if (!(input >> count) || count > 4096) return;
-                for (size_t index = 0; index < count; ++index) {
-                    Provider provider;
-                    if (!(input >> std::quoted(provider.app) >> std::quoted(provider.id) >>
-                          std::quoted(provider.label)) || provider.app.empty() || provider.id.empty())
-                        return;
-                    providers->push_back(std::move(provider));
-                }
-            }
-            int seconds{};
-            if (input >> seconds) {
-                for (int index = 0; index < refreshIntervalCount; ++index) {
-                    if (refreshIntervals[index].seconds == seconds)
-                        refreshInterval_ = index;
-                }
-            }
-            selected_ = period;
-            showCny_ = cny != 0;
-            billingRate_ = rate;
-            tokenProviders_ = std::move(tokens);
-            costProviders_ = std::move(costs);
-            currencyInitialized_ = true;
-            preferencesSaved_ = true;
-        } catch (...) {
-            // Use defaults and the legacy billing rate if preferences cannot be read.
-        }
-    }
-
-    void ApplyShortcut(int period, bool cny) {
-        preferencesSaved_ = SavePreferences(period, cny, billingRate_, refreshInterval_, tokenProviders_, costProviders_);
-        selected_ = period;
-        showCny_ = cny;
-        currencyInitialized_ = true;
-    }
-
-    UsagePlugin() { RestorePreferences(); }
-
     struct Options {
         int period{};
         bool cny{};
         double rate{};
-        int refreshInterval = defaultRefreshInterval;
+        double defaultMultiplier{1.0};
+        double selectedMultiplier{};
         std::vector<Provider> providers;
         std::vector<Provider> selectedProviders[2];
         bool providersAvailable{};
     };
 
     static INT_PTR CALLBACK OptionsProcedure(HWND dialog, UINT message, WPARAM command, LPARAM data) {
-        constexpr int refreshControl = 1010;
         constexpr int periodControl = 1001;
         constexpr int currencyControl = 1002;
         constexpr int providerControls[] = {1004, 1005};
@@ -567,11 +532,18 @@ private:
             for (const auto* currency : {L"美元 (USD)", L"人民币 (CNY)"})
                 SendDlgItemMessageW(dialog, currencyControl, CB_ADDSTRING, 0,
                                     reinterpret_cast<LPARAM>(currency));
-            for (const auto& interval : refreshIntervals)
-                SendDlgItemMessageW(dialog, refreshControl, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(interval.label));
-            SendDlgItemMessageW(dialog, refreshControl, CB_SETCURSEL, options->refreshInterval, 0);
             SendDlgItemMessageW(dialog, periodControl, CB_SETCURSEL, options->period, 0);
             SendDlgItemMessageW(dialog, currencyControl, CB_SETCURSEL, options->cny, 0);
+            if (options->selectedMultiplier > 0) {
+                wchar_t selected[64];
+                swprintf_s(selected, L"%.15g", options->selectedMultiplier);
+                SetDlgItemTextW(dialog, 1011, selected);
+            }
+            if (options->defaultMultiplier > 0) {
+                wchar_t multiplier[64];
+                swprintf_s(multiplier, L"%.15g", options->defaultMultiplier);
+                SetDlgItemTextW(dialog, 1010, multiplier);
+            }
             if (options->rate > 0) {
                 wchar_t value[64];
                 swprintf_s(value, L"%.15g", options->rate);
@@ -617,6 +589,15 @@ private:
         }
         if (control == IDOK) {
             auto* options = reinterpret_cast<Options*>(GetWindowLongPtrW(dialog, DWLP_USER));
+            wchar_t multiplier[64]{};
+            GetDlgItemTextW(dialog, 1010, multiplier, _countof(multiplier));
+            wchar_t* multiplierEnd{};
+            options->defaultMultiplier = wcstod(multiplier, &multiplierEnd);
+            if (*multiplier && (multiplierEnd == multiplier || *multiplierEnd || !std::isfinite(options->defaultMultiplier) || options->defaultMultiplier <= 0 || options->defaultMultiplier > 1000)) {
+                MessageBoxW(dialog, L"请输入大于 0 且不超过 1000 的默认倍率。", L"倍率设置", MB_ICONWARNING);
+                return TRUE;
+            }
+            if (!*multiplier) options->defaultMultiplier = 1.0;
             wchar_t value[64]{};
             GetDlgItemTextW(dialog, 1003, value, _countof(value));
             wchar_t* end{};
@@ -628,11 +609,9 @@ private:
                 return TRUE;
             }
             const auto period = SendDlgItemMessageW(dialog, periodControl, CB_GETCURSEL, 0, 0);
-            const auto refresh = SendDlgItemMessageW(dialog, refreshControl, CB_GETCURSEL, 0, 0);
-            if (period < 0 || period >= periodCount || refresh < 0 || refresh >= refreshIntervalCount)
+            if (period < 0 || period >= periodCount)
                 return TRUE;
             options->period = static_cast<int>(period);
-            options->refreshInterval = static_cast<int>(refresh);
             options->cny = SendDlgItemMessageW(dialog, currencyControl, CB_GETCURSEL, 0, 0) == 1;
             if (options->providersAvailable) {
                 for (int group = 0; group < 2; ++group) {
@@ -658,9 +637,12 @@ private:
     static void ActivateItem(bool toggleCurrency) {
         auto& plugin = Instance();
         const std::lock_guard<std::mutex> lock(plugin.refreshMutex_);
-        const int period = toggleCurrency ? plugin.selected_ : (plugin.selected_ + 1) % periodCount;
-        const bool cny = toggleCurrency ? !plugin.showCny_ : plugin.showCny_;
-        plugin.ApplyShortcut(period, cny);
+        if (toggleCurrency) {
+            plugin.showCny_ = !plugin.showCny_;
+            plugin.currencyInitialized_ = true;
+        }
+        else
+            plugin.selected_ = (plugin.selected_ + 1) % periodCount;
         plugin.Refresh(true);
     }
 
@@ -668,13 +650,14 @@ private:
         const auto now = GetTickCount64();
         if (!force && nextRefresh_ && now < nextRefresh_)
             return;
-        nextRefresh_ = now + refreshIntervals[refreshInterval_].seconds * 1000ULL;
+        nextRefresh_ = now + 15000;
 
         const auto& period = periods[selected_];
         Totals usage, costUsage;
         CurrencySettings currency;
         bool available = false;
         bool costAvailable = false;
+        const double displayMultiplier = defaultMultiplier_ > 0 ? defaultMultiplier_ : 1.0;
         try {
             currency = ReadCurrencySettings();
             available = ReadUsage(period, usage, tokenProviders_);
@@ -682,7 +665,15 @@ private:
                 costUsage = usage;
                 costAvailable = available;
             } else {
-                costAvailable = ReadUsage(period, costUsage, costProviders_);
+                const auto providers = costProviders_.empty() ? ReadProviders() : costProviders_;
+                costAvailable = !providers.empty();
+                for (const auto& provider : providers) {
+                    Totals part;
+                    if (!ReadUsage(period, part, {provider})) { costAvailable = false; break; }
+                    const auto it = providerMultipliers_.find(provider.Key());
+                    const double factor = it != providerMultipliers_.end() ? it->second : displayMultiplier;
+                    costUsage.cost += part.cost * factor;
+                }
             }
         } catch (...) {
             // Keep failures in the plugin from propagating into TrafficMonitor.
@@ -695,7 +686,7 @@ private:
         if (!available && !costAvailable) {
             tokens_.SetValue(period, L"--");
             cost_.SetValue(period, L"--");
-            wcscpy_s(tooltip_, L"CC Switch 用量暂不可读，将在下次刷新时重试。");
+            wcscpy_s(tooltip_, L"CC Switch 用量暂不可读，15 秒后重试。");
             return;
         }
 
@@ -713,12 +704,13 @@ private:
 
         wchar_t converted[128]{};
         const double rate = billingRate_ > 0 ? billingRate_ : currency.cnyPerUsd;
+        const double multiplier = defaultMultiplier_ > 0 ? defaultMultiplier_ : 1.0;
         if (!showCny_) {
             swprintf_s(value, L"$%.4f", costUsage.cost);
         } else if (rate > 0) {
-            swprintf_s(value, L"¥%.4f", costUsage.cost * rate);
+            swprintf_s(value, L"¥%.4f", costUsage.cost * multiplier * rate);
             swprintf_s(converted, L"折算 ≈ %.6f CNY（%ls %.8g 元/USD）\n",
-                       costUsage.cost * rate, billingRate_ > 0 ? L"自定义实付" : L"CC Switch 汇率", rate);
+                       costUsage.cost * multiplier * rate, billingRate_ > 0 ? L"自定义实付" : L"CC Switch 汇率", rate);
         } else {
             wcscpy_s(value, L"¥--");
             wcscpy_s(converted, L"CC Switch 暂无可用人民币汇率。\n");
@@ -756,7 +748,7 @@ public:
         case TMI_NAME: return L"CC Switch Usage";
         case TMI_DESCRIPTION: return L"显示 CC Switch Token 和费用，支持切换统计周期与显示币种。";
         case TMI_AUTHOR: return L"CC Switch Usage contributors";
-        case TMI_VERSION: return L"0.1.14";
+        case TMI_VERSION: return L"0.1.11";
         default: return L"";
         }
     }
@@ -771,9 +763,9 @@ private:
     int selected_{};
     bool showCny_{};
     double billingRate_ = LoadBillingRate();
+    double defaultMultiplier_ = 1.0;
+    std::unordered_map<std::wstring, double> providerMultipliers_;
     bool currencyInitialized_{};
-    bool preferencesSaved_{};
-    int refreshInterval_ = defaultRefreshInterval;
     ULONGLONG nextRefresh_{};
     wchar_t tooltip_[768] = L"正在读取 CC Switch 用量。";
 };
@@ -783,3 +775,4 @@ private:
 extern "C" __declspec(dllexport) ITMPlugin* TMPluginGetInstance() {
     return &UsagePlugin::Instance();
 }
+

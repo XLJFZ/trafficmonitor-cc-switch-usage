@@ -1,30 +1,24 @@
-# CC Switch Usage for TrafficMonitor
+# CC Switch Usage 0.1.1
 
-在 Windows 任务栏显示 CC Switch 记录的 Token 和费用。两项可分别筛选供应商。
+TrafficMonitor 任务栏插件，读取本机 CC Switch 的用量记录。选择与 TrafficMonitor 位数一致的压缩包，解压到 `TrafficMonitor.exe` 所在目录，然后重启 TrafficMonitor。
 
-## 安装
+1. 从托盘菜单打开「显示任务栏窗口」。
+2. 右键任务栏监控区，打开「显示设置」，勾选「CC Switch Token」和「CC Switch 费用」。
+3. 双击其中任意一项，即可循环切换今日、近 7 天和近 30 天。两项使用同一周期，重新启动后从今日开始。
 
-1. 从 GitHub 的 Releases 下载与 TrafficMonitor 位数一致的 ZIP。发布包面向 Windows 10/11。
-2. 退出 TrafficMonitor，将 ZIP 解压到 `TrafficMonitor.exe` 所在目录。插件文件应位于 `plugins/CCSwitchUsage.dll`。
-3. 重新启动 TrafficMonitor。在任务栏监控区右键打开「显示设置」，勾选「CC Switch Token」和「CC Switch 费用」。
+按住 Shift 并双击「CC Switch 费用」，即可在美元和人民币之间切换。也可通过任务栏右键菜单中的插件命令选择币种。重启后默认显示美元。
 
-## 使用
+人民币金额由 CC Switch 记录的美元费用折算。内置参考汇率为 1 USD = 7.2 CNY，不会联网更新。若需自定义，在 DLL 所在的 `plugins` 目录创建 `CCSwitchUsage.ini`，填入以下内容。显示人民币时，下一次刷新会读取新汇率。
 
-- 双击任务栏里的 Token 或费用，切换今日、最近 24 小时、近 7 天和近 30 天。今日从本地零点开始，最近 24 小时按当前时刻滚动。近 7 天和近 30 天都包含今天。
-- 按住 Shift 双击费用，可切换美元和人民币。
-- 在「插件管理 → CC Switch Usage → 选项」中，可设置周期、币种和人民币实付单价。填入 `0.12` 表示每记录 1 美元用量，按实付 0.12 元显示。留空时用 CC Switch 保存的汇率。
-- Token 和费用分别多选供应商。每列均可全选和反选，留空时统计全部供应商。点击「确定」后，统计周期、币种、实付单价和两列供应商会在下次启动时恢复。任务栏快捷操作也会保存周期和币种。
+```ini
+[Currency]
+CnyPerUsd=7.2
+```
 
-Token 是数据库记录的输入与输出之和。悬停可查看缓存字段和费用。日历周期包含历史归档，滚动 24 小时使用带有具体时间的请求记录。
+统计按 Windows 本地日历计算，近 7 天和近 30 天均包含今天。Token 为数据库记录的输入与输出之和，缓存字段在悬停详情中单列。费用是 CC Switch 记录的美元金额。插件每隔约 15 秒读取一次数据库，范围包含各供应商的本地请求记录和历史归档。
 
-刷新间隔默认 30 秒，可在「选项」中选择 5 秒、15 秒、30 秒、1 分钟、2 分钟、5 分钟、10 分钟或 30 分钟。设置在重启后保留，切换周期、币种或应用新设置时会立即刷新。
+数据库默认位于 `%USERPROFILE%\.cc-switch\cc-switch.db`，使用只读连接。显示 `--` 时，可检查数据库位置和 CC Switch 的用量记录。
 
-插件按设定间隔读取 `%USERPROFILE%\.cc-switch` 下的本地用量数据库和汇率设置。数据库以只读方式打开，插件不联网。如果没有可用汇率，可以切换为美元。
+源码可用 Visual Studio 的 C++ 开发环境与 Windows SDK 构建。在相应架构的 Developer Command Prompt 中运行 `build.cmd x64` 或 `build.cmd x86`。
 
-## 从源码构建
-
-安装 Visual Studio 的 C++ 桌面开发工具和 Windows SDK。打开对应架构的 Developer Command Prompt，运行 `build.cmd x64` 或 `build.cmd x86`。DLL 输出到对应架构的目录。
-
-## 来源和许可
-
-TrafficMonitor 插件接口沿用 [bemaru/trafficmonitor-ai-usage-plugin v0.3.13](https://github.com/bemaru/trafficmonitor-ai-usage-plugin/tree/v0.3.13) 收录的接口头文件。保留原有版权和许可声明，见 [LICENSE](LICENSE) 和 [NOTICE.md](NOTICE.md)。
+插件接口头文件取自 bemaru/trafficmonitor-ai-usage-plugin v0.3.13，其中保留了 TrafficMonitor 原有的版权声明。许可见 `LICENSE`。
