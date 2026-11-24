@@ -17,6 +17,7 @@ void CALLBACK EditRates(HWND, UINT, UINT_PTR timer, DWORD) {
 }
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc < 3) return 6;
     const auto module = LoadLibraryW(argv[1]);
     if (!module) return 1;
     const auto entry = reinterpret_cast<ITMPlugin*(*)()>(GetProcAddress(module, "TMPluginGetInstance"));
@@ -28,6 +29,15 @@ int wmain(int argc, wchar_t** argv) {
         if (plugin->ShowOptionsDialog(nullptr) != ITMPlugin::OR_OPTION_CHANGED || !edited) return 5;
     }
     const wchar_t* actual = plugin->GetItem(1)->GetItemValueText();
+    const auto deadline = GetTickCount64() + 10000;
+    while (wcscmp(actual, L"--") == 0) {
+        if (GetTickCount64() >= deadline) {
+            fwprintf(stderr, L"Timed out waiting for first refresh\n");
+            return 7;
+        }
+        Sleep(10);
+        actual = plugin->GetItem(1)->GetItemValueText();
+    }
     if (!wcsstr(actual, argv[2])) {
         wprintf(L"Expected %ls, got %ls\n", argv[2], actual);
         return 3;

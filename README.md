@@ -1,4 +1,4 @@
-# CC Switch Usage 0.1.17
+# CC Switch Usage 0.1.18
 
 在 TrafficMonitor 任务栏显示本机 CC Switch 的 Token 用量和费用。
 
@@ -21,7 +21,7 @@
 
 设置保存在 `%APPDATA%\TrafficMonitor\CCSwitchUsage.ini`。升级时会迁移可唯一匹配的旧供应商设置。如旧名称已变更或有多个同名项，可在选项中取消「未匹配」的旧筛选项，再勾选对应供应商。
 
-插件约每 15 秒只读查询一次 `%USERPROFILE%\\.cc-switch\\cc-switch.db`。用量暂不可读时，任务栏会显示 `--`。请确认 CC Switch 已运行过并已生成该数据库文件，且使用的 TrafficMonitor 与插件位数一致。仓库中的 `CCSwitchUsage-v0.1.17-x64.zip` 和 `CCSwitchUsage-v0.1.17-x86.zip` 分别对应 64 位和 32 位 TrafficMonitor。
+插件约每 15 秒只读查询一次 `%USERPROFILE%\\.cc-switch\\cc-switch.db`。用量暂不可读时，任务栏会显示 `--`。请确认 CC Switch 已运行过并已生成该数据库文件，且使用的 TrafficMonitor 与插件位数一致。仓库中的 `CCSwitchUsage-v0.1.18-x64.zip` 和 `CCSwitchUsage-v0.1.18-x86.zip` 分别对应 64 位和 32 位 TrafficMonitor。
 
 ## 从源码构建
 

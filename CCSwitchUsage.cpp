@@ -14,7 +14,7 @@
 #include <cwchar>
 #include <cmath>
 #include <ctime>
-#include <thread>
+
 #include <atomic>
 #include "include/PluginInterface.h"
 
@@ -306,7 +306,7 @@ public:
                   DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
         const auto value = GetItemValueText();
         const auto displayValue = wcsstr(value, L"--") ? sample_ : value;
-        DrawTextW(canvas, displayValue, -1, &valueArea,
+        DrawTextW(canvas, value, -1, &valueArea,
                   DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
         RestoreDC(canvas, saved);
     }
@@ -378,17 +378,30 @@ public:
     }
 
     void DataRequired() override {
+        if (GetTickCount64() < nextRefresh_.load()) return;
         bool expected = false;
         if (!refreshRunning_.compare_exchange_strong(expected, true)) return;
-        std::thread([this] {
-            {
-                const std::lock_guard<std::mutex> refresh(refreshMutex_);
-                Refresh(false);
-            }
-            refreshRunning_ = false;
-        }).detach();
+
+        HMODULE module{};
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(&RunRefresh), &module)) {
+            if (TrySubmitThreadpoolCallback(RunRefresh, module, nullptr)) return;
+            FreeLibrary(module);
+        }
+        refreshRunning_ = false;
     }
 
+    static void CALLBACK RunRefresh(PTP_CALLBACK_INSTANCE callback, void* module) noexcept {
+        FreeLibraryWhenCallbackReturns(callback, static_cast<HMODULE>(module));
+        auto& plugin = Instance();
+        try {
+            const std::lock_guard<std::mutex> lock(plugin.refreshMutex_);
+            plugin.Refresh(false);
+        } catch (...) {
+            // Allow the next host request to retry if publishing the result failed.
+        }
+        plugin.refreshRunning_ = false;
+    }
     OptionReturn ShowOptionsDialog(void* parent) override {
         Options options;
         {
@@ -1001,7 +1014,7 @@ private:
 
     void Refresh(bool force) {
         const auto now = GetTickCount64();
-        if (!force && nextRefresh_ && now < nextRefresh_)
+        if (!force && now < nextRefresh_.load())
             return;
         nextRefresh_ = now + 2000;
 
@@ -1069,7 +1082,7 @@ private:
         if (!available) {
             tokens_.SetValue(period, L"--");
             cost_.SetValue(period, L"--");
-            wcscpy_s(tooltip_, L"CC Switch 用量暂不可读，15 秒后重试。");
+            wcscpy_s(tooltip_, L"CC Switch 用量暂不可读，将自动重试。");
             return;
         }
         nextRefresh_ = now + 15000;
@@ -1142,7 +1155,7 @@ public:
         case TMI_NAME: return L"CC Switch Usage";
         case TMI_DESCRIPTION: return L"显示 CC Switch Token 和费用，支持切换统计周期与显示币种。";
         case TMI_AUTHOR: return L"CC Switch Usage contributors";
-        case TMI_VERSION: return L"0.1.17";
+        case TMI_VERSION: return L"0.1.18";
         default: return L"";
         }
     }
@@ -1162,7 +1175,7 @@ private:
     Details details_;
     bool currencyInitialized_{};
     bool providerFiltersInitialized_{};
-    ULONGLONG nextRefresh_{};
+    std::atomic<ULONGLONG> nextRefresh_{};
     wchar_t tooltip_[768] = L"正在读取 CC Switch 用量。";
 };
 
